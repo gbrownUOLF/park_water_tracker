@@ -2,9 +2,10 @@ import time
 import requests
 import duckdb
 from datetime import datetime, timezone
+from pathlib import Path
 
 URL = "https://scada.mtregional.org/olympicpark"
-DB_PATH = "water.duckdb"
+DB_PATH = r"C:\park_water_tracker\water.duckdb"   # <-- raw string
 TABLE = "bronze_park_water_readings"
 
 DDL = f"""
@@ -19,51 +20,40 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
 );
 """
 
-INSERT = f"""
+INSERT_SQL = f"""
 INSERT INTO {TABLE} (
   event_ts_utc, p_date, flow_2in, flow_8in, tank_level, total_2in, total_8in
 ) VALUES (?, ?, ?, ?, ?, ?, ?);
 """
 
+# Ensure folder exists
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+# One-time bootstrap
+with duckdb.connect(DB_PATH) as con:
+    con.execute(DDL)
+
 def fetch():
     r = requests.get(URL, timeout=10)
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    now = datetime.now(timezone.utc)
+    return (
+        now,
+        now.date(),
+        j.get("Oly Park 2in Flow"),
+        j.get("Oly Park 8in Flow"),
+        j.get("Tank Level"),
+        j.get("Oly Park 2in Total"),
+        j.get("Oly Park 8in Total"),
+    )
 
-def normalize(j):
-    return {
-        "flow_2in": j.get("Oly Park 2in Flow"),
-        "flow_8in": j.get("Oly Park 8in Flow"),
-        "tank_level": j.get("Tank Level"),
-        "total_2in": j.get("Oly Park 2in Total"),
-        "total_8in": j.get("Oly Park 8in Total"),
-    }
-
-def main():
-    con = duckdb.connect(DB_PATH)
-    con.execute("PRAGMA threads=4")
-    con.execute(DDL)
-
-    while True:
-        try:
-            j = fetch()
-            vals = normalize(j)
-            ts = datetime.now(timezone.utc)
-            row = (
-                ts,
-                ts.date(),
-                vals["flow_2in"],
-                vals["flow_8in"],
-                vals["tank_level"],
-                vals["total_2in"],
-                vals["total_8in"],
-            )
-            con.execute(INSERT, row)
+while True:
+    try:
+        row = fetch()
+        with duckdb.connect(DB_PATH) as con:
+            con.execute(INSERT_SQL, row)
             con.commit()
-            # print(f"Inserted at {ts.isoformat()}")
-        except Exception as e:
-            print(f"[warn] {e}")
-        time.sleep(30)
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        print("[ingestor warn]", e)
+    time.sleep(30)

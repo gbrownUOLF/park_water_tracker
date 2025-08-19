@@ -1,11 +1,12 @@
 import duckdb
 import pandas as pd
 import streamlit as st
+import time
 from streamlit_autorefresh import st_autorefresh
 import altair as alt
 from datetime import timedelta, datetime, timezone
 
-DB_PATH = "water.duckdb"
+DB_PATH = "C:\park_water_tracker\water.duckdb"
 TABLE = "bronze_park_water_readings"
 
 st.set_page_config(page_title="Water Telemetry (PoC)", layout="wide")
@@ -15,11 +16,19 @@ st_autorefresh(interval=5_000, key="autorefresh")
 
 @st.cache_resource
 def get_conn():
-    con = duckdb.connect(DB_PATH, read_only=True)
-    con.execute("PRAGMA threads=4")
-    return con
+    # Make sure DB_PATH is defined above
+    return duckdb.connect(DB_PATH, read_only=True)
 
-con = get_conn()
+def safe_df(sql, params=None, tries=3, delay=0.3):
+    con = get_conn()  # reuse the cached read-only connection
+    for i in range(tries):
+        try:
+            return con.execute(sql, params or []).df()
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+
 
 # Controls
 colc1, colc2, colc3 = st.columns(3)
@@ -34,7 +43,8 @@ with colc3:
 now_utc = datetime.now(timezone.utc)
 start_ts = pd.Timestamp(now_utc - timedelta(minutes=window_minutes))
 
-df = con.execute(
+# Base pull (parameterized by start_ts)
+df = safe_df(
     f"""
     SELECT *
     FROM {TABLE}
@@ -42,34 +52,26 @@ df = con.execute(
     ORDER BY event_ts_utc
     """,
     [start_ts]
-).df()
+)
 
 st.title("🏔️ Olympic Park – Water Telemetry (Local PoC)")
 
-# KPIs
-if not df.empty:
-    latest = df.iloc[-1]
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Tank Level", f"{latest['tank_level']:.2f}")
-    k2.metric("Flow 2in", f"{latest['flow_2in']:.2f}")
-    k3.metric("Flow 8in", f"{latest['flow_8in']:.2f}")
-    k4.metric("Last Update (UTC)", pd.to_datetime(latest['event_ts_utc']).strftime("%H:%M:%S"))
-else:
+if df.empty:
     st.info("Waiting for data…")
     st.stop()
 
 # Optional downsampling (DuckDB time_bucket)
 if downsample != "None":
     bucket = {"1m": "60s", "5m": "300s"}[downsample]
-    dfd = con.execute(
+    dfd = safe_df(
         f"""
         WITH b AS (
           SELECT time_bucket(INTERVAL '{bucket}', event_ts_utc) AS bucket_ts,
-                 avg(flow_2in) AS flow_2in,
-                 avg(flow_8in) AS flow_8in,
-                 avg(tank_level) AS tank_level,
-                 max(total_2in) AS total_2in,
-                 max(total_8in) AS total_8in
+                 avg(flow_2in)     AS flow_2in,
+                 avg(flow_8in)     AS flow_8in,
+                 avg(tank_level)   AS tank_level,
+                 max(total_2in)    AS total_2in,
+                 max(total_8in)    AS total_8in
           FROM {TABLE}
           WHERE event_ts_utc >= ?
           GROUP BY 1
@@ -78,13 +80,25 @@ if downsample != "None":
         SELECT * FROM b
         """,
         [start_ts]
-    ).df()
-    df = dfd.rename(columns={"bucket_ts": "event_ts_utc"})
+    )
+    dfd = dfd.rename(columns={"bucket_ts": "event_ts_utc"})
+    df = dfd
+
+if df.empty:
+    st.info("No data in the selected window yet.")
+    st.stop()
 
 # Transform for plotting
 df["event_ts_utc"] = pd.to_datetime(df["event_ts_utc"])
-# df = df.set_index("event_ts_utc")
 df["total_flow"] = df["flow_2in"] + df["flow_8in"]
+
+# KPIs (use latest row)
+latest = df.iloc[-1]
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Tank Level", f"{latest['tank_level']:.2f}")
+k2.metric("Flow 2in", f"{latest['flow_2in']:.2f}")
+k3.metric("Flow 8in", f"{latest['flow_8in']:.2f}")
+k4.metric("Last Update (UTC)", pd.to_datetime(latest['event_ts_utc']).strftime("%H:%M:%S"))
 
 # Charts
 tab1, tab2 = st.tabs(["Flows & Level", "Totals"])
@@ -106,29 +120,25 @@ with tab2:
         st.subheader("Total Consumption Watch")
 
         # Flow line
-        line_flow = alt.Chart(df).mark_line(color="steelblue").encode(
+        line_flow = alt.Chart(df).mark_line().encode(
             x="event_ts_utc:T",
-            y=alt.Y("total_flow:Q", scale=alt.Scale(domain=[0,350]))
+            y=alt.Y("total_flow:Q", scale=alt.Scale(domain=[0, 350]))
         )
 
         # Constant horizontal line at y=300
         line_threshold = alt.Chart(pd.DataFrame({"y": [300]})).mark_rule(
-            color="red", strokeDash=[5,5]
+            color="red", strokeDash=[5, 5]
         ).encode(
-            y="y"
+            y="y:Q"
         )
 
-        chart = (line_flow + line_threshold).properties(
-            width=600, height=300
-        )
+        st.altair_chart((line_flow + line_threshold), use_container_width=True)
 
-        st.altair_chart(chart, use_container_width=True)
     with c2:
         if show_totals:
             st.subheader("Cumulative Totals (as reported)")
             st.line_chart(df.set_index("event_ts_utc")[["total_2in", "total_8in"]])
         else:
-            # per-interval delta of totals (approximate usage)
             df2 = df.copy()
             df2["total_2in_delta"] = df2["total_2in"].diff().clip(lower=0)
             df2["total_8in_delta"] = df2["total_8in"].diff().clip(lower=0)
