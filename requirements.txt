@@ -1,0 +1,6 @@
+pandas
+duckdb
+requests
+streamlit
+streamlit-autorefresh
+altair
