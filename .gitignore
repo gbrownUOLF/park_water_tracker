@@ -1,2 +1,4 @@
 venv
 landing
+water_log*
+water.duckdb

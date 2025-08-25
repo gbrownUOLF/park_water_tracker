@@ -1,4 +1,4 @@
-import duckdb
+import sqlite3
 import pandas as pd
 import streamlit as st
 import time
@@ -6,8 +6,8 @@ from streamlit_autorefresh import st_autorefresh
 import altair as alt
 from datetime import timedelta, datetime, timezone
 
-DB_PATH = "C:\park_water_tracker\water.duckdb"
-TABLE = "bronze_park_water_readings"
+DB_PATH = r"C:\park_water_tracker\water_log.db"
+TABLE = "water_log"  
 
 st.set_page_config(page_title="Water Telemetry (PoC)", layout="wide")
 
@@ -16,15 +16,18 @@ st_autorefresh(interval=5_000, key="autorefresh")
 
 @st.cache_resource
 def get_conn():
-    # Make sure DB_PATH is defined above
-    return duckdb.connect(DB_PATH, read_only=True)
+    # Use URI so we can open read-only and enable shared cache
+    # Note: 'timeout' helps if a checkpoint is happening; readers are non-blocking in WAL mode.
+    uri = f"file:{DB_PATH}?mode=ro&cache=shared"
+    return sqlite3.connect(uri, uri=True, timeout=1.0, check_same_thread=False)
 
 def safe_df(sql, params=None, tries=3, delay=0.3):
-    con = get_conn()  # reuse the cached read-only connection
+    con = get_conn()
     for i in range(tries):
         try:
-            return con.execute(sql, params or []).df()
-        except Exception as e:
+            # pandas handles parameter substitution with sqlite3 DB-API
+            return pd.read_sql_query(sql, con, params=params or [])
+        except Exception:
             if i == tries - 1:
                 raise
             time.sleep(delay)
@@ -51,7 +54,7 @@ df = safe_df(
     WHERE event_ts_utc >= ?
     ORDER BY event_ts_utc
     """,
-    [start_ts]
+    [start_ts.isoformat()]   # store as ISO-8601 strings; matches the writer
 )
 
 st.title("🏔️ Olympic Park – Water Telemetry (Local PoC)")
@@ -61,25 +64,31 @@ if df.empty:
     st.stop()
 
 # Optional downsampling (DuckDB time_bucket)
-if downsample != "None":
-    bucket = {"1m": "60s", "5m": "300s"}[downsample]
+if downsample == "1m":
+    bucket_size = 60
+elif downsample == "5m":
+    bucket_size = 300
+else:
+    bucket_size = None
+
+if bucket_size:
     dfd = safe_df(
-        f"""
+        """
         WITH b AS (
-          SELECT time_bucket(INTERVAL '{bucket}', event_ts_utc) AS bucket_ts,
-                 avg(flow_2in)     AS flow_2in,
-                 avg(flow_8in)     AS flow_8in,
-                 avg(tank_level)   AS tank_level,
-                 max(total_2in)    AS total_2in,
-                 max(total_8in)    AS total_8in
-          FROM {TABLE}
+          SELECT datetime(strftime('%s', event_ts_utc) / ? * ? , 'unixepoch') AS bucket_ts,
+                 avg(flow_2in)   AS flow_2in,
+                 avg(flow_8in)   AS flow_8in,
+                 avg(tank_level) AS tank_level,
+                 max(total_2in)  AS total_2in,
+                 max(total_8in)  AS total_8in
+          FROM water_log
           WHERE event_ts_utc >= ?
-          GROUP BY 1
-          ORDER BY 1
+          GROUP BY bucket_ts
+          ORDER BY bucket_ts
         )
         SELECT * FROM b
         """,
-        [start_ts]
+        [bucket_size, bucket_size, start_ts.isoformat()]
     )
     dfd = dfd.rename(columns={"bucket_ts": "event_ts_utc"})
     df = dfd
@@ -104,15 +113,55 @@ k4.metric("Last Update (UTC)", pd.to_datetime(latest['event_ts_utc']).strftime("
 tab1, tab2 = st.tabs(["Flows & Level", "Totals"])
 
 with tab1:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Flow – 2in")
-        st.line_chart(df.set_index("event_ts_utc")["flow_2in"])
-    with c2:
-        st.subheader("Flow – 8in")
-        st.line_chart(df.set_index("event_ts_utc")["flow_8in"])
-    st.subheader("Tank Level")
-    st.line_chart(df.set_index("event_ts_utc")["tank_level"])
+    # Selector to toggle series on/off
+    series_options = ["flow_2in", "flow_8in", "total_flow"]
+    selected = st.multiselect(
+        "Select lines to display",
+        options=series_options,
+        default=series_options
+    )
+
+    # Long-form for Altair
+    df_long = (
+        df[["event_ts_utc", "flow_2in", "flow_8in", "total_flow"]]
+        .melt("event_ts_utc", var_name="series", value_name="value")
+    )
+    if selected:
+        df_long = df_long[df_long["series"].isin(selected)]
+    else:
+        # If nothing selected, show empty frame to avoid errors
+        df_long = df_long.iloc[0:0]
+
+    # Optional: legend-based toggling too
+    sel = alt.selection_point(fields=["series"], bind="legend", toggle=True)
+
+    # Lines
+    lines = (
+        alt.Chart(df_long)
+        .mark_line()
+        .encode(
+            x=alt.X("event_ts_utc:T", title="Time (UTC)"),
+            y=alt.Y("value:Q", title="Flow (gpm)"),
+            color=alt.Color("series:N", title="Series"),
+            tooltip=[
+                alt.Tooltip("event_ts_utc:T", title="Time (UTC)"),
+                alt.Tooltip("series:N", title="Series"),
+                alt.Tooltip("value:Q", title="Value", format=".2f"),
+            ],
+            opacity=alt.condition(sel, alt.value(1.0), alt.value(0.2)),
+        )
+        .add_params(sel)   # still valid in v5
+    )
+
+    # Static horizontal threshold at 300
+    rule = (
+        alt.Chart(pd.DataFrame({"y": [300]}))
+        .mark_rule(strokeDash=[5, 5], color="red")
+        .encode(y="y:Q")
+    )
+
+    st.subheader("Flows (2in, 8in, Total) with Threshold")
+    st.altair_chart(lines + rule, use_container_width=True)
 
 with tab2:
     c1, c2 = st.columns(2)
@@ -145,4 +194,4 @@ with tab2:
             st.subheader("Incremental Totals (derived per interval)")
             st.line_chart(df2.set_index("event_ts_utc")[["total_2in_delta", "total_8in_delta"]])
 
-st.caption("Auto-refreshing every 5 seconds · Data source polled every 30 seconds by ingestor.py")
+st.caption("Auto-refreshing every 5 seconds · Data source polled every 15 seconds by ingestor.py")
